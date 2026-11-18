@@ -1,0 +1,10 @@
+{
+  "_source": "nvidia.nvue httpapi.py normalize_spec docstring example + NVUE CLI reference; verify against a real switch",
+  "br_default": {
+    "type": "vlan-aware",
+    "vlan": {
+      "10": {},
+      "20": {}
+    }
+  }
+}

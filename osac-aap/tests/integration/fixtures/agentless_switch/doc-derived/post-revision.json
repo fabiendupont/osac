@@ -1,0 +1,6 @@
+{
+  "_source": "nvidia.nvue httpapi.py create_revision(): response is a dict whose first key is the new revision id; shape assumed; verify against a real switch",
+  "<id>": {
+    "state": "pending"
+  }
+}

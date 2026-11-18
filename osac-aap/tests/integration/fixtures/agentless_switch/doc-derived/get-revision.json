@@ -1,0 +1,4 @@
+{
+  "_source": "nvidia.nvue httpapi.py apply_config() poll loop: GET revision/<id> until state == 'applied'; verify against a real switch",
+  "state": "applied"
+}

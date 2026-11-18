@@ -1,0 +1,6 @@
+{
+  "_source": "assumed from NVUE CLI 'nv show system global reserved vlan'; default range from Cumulus docs; verify against a real switch",
+  "reserved": {
+    "vlans": "1-36,4045-4094"
+  }
+}

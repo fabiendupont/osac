@@ -1,0 +1,19 @@
+{
+  "_source": "NVUE CLI reference (nv set interface <port> bridge domain ...); key spelling 'bridge-domain' per plugin key normalization; verify against a real switch",
+  "swp1": {
+    "bridge-domain": {
+      "br_default": {
+        "access": "10"
+      }
+    }
+  },
+  "swp2": {
+    "bridge-domain": {
+      "br_default": {
+        "vlan": {
+          "10": {}
+        }
+      }
+    }
+  }
+}
