@@ -8,10 +8,10 @@ Issue: [OSAC-7869](https://redhat.atlassian.net/browse/OSAC-7869)
 
 Replace the direct `nv` commands in network-runner's Cumulus switch
 provider with modules from the [`nvidia.nvue`][galaxy] Ansible collection,
-while preserving the switch-management behavior that AgentlessNet
-(Agentless VLAN Fabric Manager) depends on: bridge-domain VLAN
-create/delete, trunk/access port configuration, VLAN discovery, and the
-deletion-guard serialization.
+with the NVUE REST API as the stated target transport, while preserving
+the switch-management behavior that AgentlessNet (Agentless VLAN Fabric
+Manager) depends on: bridge-domain VLAN create/delete, trunk/access port
+configuration, VLAN discovery, and the deletion-guard serialization.
 
 [galaxy]: https://galaxy.ansible.com/ui/repo/published/nvidia/nvue/
 
@@ -40,111 +40,172 @@ Read tasks (`list_vlans`, `get_port_conf`) use `bridge -j vlan show`,
 `/etc/cumulus/switchd.conf`. `set_deletion_guard` uses only `flock` and
 `install` (no `nv`).
 
+## Why REST is the target
+
+### The Netris precedent inside OSAC
+
+OSAC's networking stack is already API-first wherever a controller
+exists. The Netris Fabric Manager integration never touches a switch:
+`collections/ansible_collections/netris/controller/` modules speak the
+Netris controller REST API, the `osac.templates` `roles/netris` role
+orchestrates them through the 19 contract tasks, and consistency is
+controller-owned (`roles/netris/tasks/apply_network_attachment.yaml`
+notes that serialization belongs to the controller). The transport is
+held to a tested standard: session-cookie redirect isolation
+(`tests/unit/test_netris_external_ip_transport.py`), enforced TLS
+certificate validation (`tests/unit/test_netris_tls.py`,
+`test_netris_validate_certs.py`), and `no_log` credential redaction.
+
+The SSH + `raw` shell pattern survives only in the controller-less
+case: AgentlessNet managing bare Cumulus switches directly. NVUE REST
+(`nvued`, fronted by nginx) is architecturally the same shape as the
+Netris controller API — a per-switch controller API. Migrating the
+Cumulus provider to REST makes the controller-less path consistent
+with the rest of the stack instead of baking SSH in further.
+
+### The industry direction
+
+SSH CLI scraping is the legacy tier for data-center NOSes. Arista EOS
+exposes eAPI (JSON-RPC over HTTPS, ~2014), Cisco NX-OS offers
+NX-API/NETCONF/RESTCONF/gNMI, IOS XE/XR speak NETCONF/RESTCONF with
+gNMI on XR, Junos is NETCONF/YANG with growing gNMI, SONiC is
+gNMI/REST against CONFIG_DB with OpenConfig models, and Nokia SR
+Linux is gNMI-first. NVIDIA's own material positions NVUE as
+API-first: the `nv` CLI is a client of the same `nvued` service the
+REST API exposes. A provider abstraction standardized on
+`ansible.netcommon.httpapi` is also the only shape that generalizes if
+network-runner later grows non-Cumulus providers (Arista, SONiC), all
+of which are API-connected.
+
+### Switch prerequisites are smaller than first assessed
+
+Since Cumulus Linux 5.6, the NVUE REST API is **enabled by default**
+on port 8765 (HTTPS, basic auth). The real caveats: on 5.4/5.5 it
+requires manual nginx enablement; the API returns 403 until the
+`cumulus` user's default password is changed; and the default
+certificate is self-signed, so a TLS-verification policy decision is
+required. The provider's supported floor should therefore be stated
+as Cumulus 5.6+ for the REST path.
+
 ## Target design
 
-### Module choice: `nvidia.nvue.command`
+### Phase 1 (interim, optional): `nvidia.nvue.command`
 
-`nvidia.nvue` offers two transports:
+`nvidia.nvue.command` is a wrapper around the `nv` CLI with Jinja
+templating, `apply`, and `assume_yes`, over the existing SSH
+connection. It removes the direct `nv` invocations without any
+inventory, fixture or switch-prerequisite change, and can land as a
+single upstream release for fleets that include pre-5.6 switches. It
+is a stepping stone only; it does not move the provider toward the
+API-first architecture above.
 
-- object-specific and `nvidia.nvue.api` modules speak the NVUE REST API
-  and require `ansible.netcommon.httpapi` plus the NVUE REST endpoint
-  (port 8765) enabled on every switch;
-- `nvidia.nvue.command` is a wrapper around the `nv` CLI with Jinja
-  templating, `apply`, and `assume_yes`, running over the existing SSH
-  connection.
+- Each mutating task becomes a `raw` guard pre-check (flock + guard
+  file, exit 73 refusal, no `nv`) followed by
+  `nvidia.nvue.command` with the same `nv set`/`nv unset` statements.
+- The `flock` serialization cannot wrap a module call; the provider
+  relies on NVUE's own apply-time locking plus the pre-check.
+- The diff-validation step is dropped (behavioral delta below).
 
-This migration uses **`nvidia.nvue.command`**. It removes the direct
-`nv` invocations (the issue's scope) without changing the management
-transport, the switch prerequisites, or the inventory contract
-(SSH-reachable Cumulus switches, no REST endpoint, no new credentials).
-A later, separate proposal may move to the REST modules.
+### Phase 2 (target): NVUE REST modules over httpapi
 
-### Mutating tasks
+Mutating and read tasks move to the `nvidia.nvue` REST modules
+(`nvidia.nvue.bridge`, `nvidia.nvue.interface`, `nvidia.nvue.api`
+for uncovered paths) with `ansible.netcommon.httpapi` and
+`ansible_network_os: nvidia.nvue.httpapi`:
 
-Each mutating provider task becomes a guarded pair:
-
-1. a `raw` pre-check that keeps the current semantics without invoking
-   `nv`: take `flock /tmp/nvue.lock`, check the guard file, release the
-   lock. Exit 73 stays the refusal signal so AgentlessNet's delete-wins
-   handling is unchanged.
-2. `nvidia.nvue.command` with a `template` rendering the same
-   `nv set`/`nv unset` statements, `apply: true`, `assume_yes: true`.
-
-The `flock` serialization cannot wrap a module call, so the provider
-instead relies on NVUE's own apply-time locking (the same lock
-`/tmp/nvue.lock` mirrors) plus the play-level pre-check. The
-diff-validation step (`nv config diff`) is dropped: it guarded against
-unexpected pending configuration from other actors, which the module's
-apply already supersedes; this behavioral delta is called out below.
-
-### Read tasks
-
-`list_vlans` and `get_port_conf` are **not migrated in this pass**.
-They read kernel bridge state (`bridge -j vlan show`) and reserved-range
-metadata, not NVUE configuration; the NVUE equivalents would change the
-discovery semantics that `tests/integration/targets/agentless_net_switch`
-asserts (normalized VLAN discovery, reserved ranges). This gap is
-documented per the issue's acceptance criteria and tracked for a
-follow-up.
-
-### Deletion guard task
-
-`set_deletion_guard` and `delete_port`'s guard check stay `raw` shell
-(no `nv` usage); unchanged.
+- **Inventory contract**: switch entries gain `ansible_host`,
+  `ansible_httpapi_port: 8765`, `ansible_httpapi_use_ssl: true`, and
+  REST credentials; SSH variables are dropped. The AgentlessNet VN
+  inventory validation (`files/validate_vn_inventory.yml`, covered by
+  the `agentless_net_stub` target) is extended to validate the REST
+  endpoint shape and to keep rejecting password-based SSH access.
+- **TLS policy**: `ansible_httpapi_validate_certs` defaults to true
+  with a documented CA-injection path for the self-signed default
+  certificate, following the Netris precedent where certificate
+  validation cannot be bypassed silently.
+- **Deletion guards**: the exit-73 delete-wins protocol is
+  reimplemented as an API-equivalent check — the guard directory
+  moves to a provider-visible location read over the same transport,
+  or the guard state moves into the caller (AgentlessNet already owns
+  delete-wins state in SQLite; a provider-local guard may become
+  unnecessary). The contract targets keep asserting the observable
+  semantics: a guarded apply refuses, and delete wins the race.
+- **Serialization**: local `flock` disappears. NVUE apply is atomic
+  per revision; cross-task ordering stays the caller's
+  responsibility, exactly as Netris delegates serialization to its
+  controller.
+- **Read tasks**: `list_vlans` moves to
+  `nv show ... --output json` equivalents via the API
+  (`nvidia.nvue.api` `operation: get`); `get_port_conf` can read
+  bridge-domain state from the NVUE model instead of kernel
+  `bridge -j vlan show`. Discovery semantics asserted by
+  `tests/integration/targets/agentless_net_switch` (normalized VLAN
+  discovery, reserved ranges) must be preserved or the delta
+  documented.
 
 ## Delivery path (vendored content constraint)
 
 `vendor/` content must not be hand-edited
 ([osac-aap/AGENTS.md](../AGENTS.md)). The provider change therefore
-lands in two places, in order:
+lands in two places, in order, per phase:
 
-1. **Upstream PR to `ybettan/network-runner`**: the provider task
-   changes above, its own molecule/unit tests, a `requirements.yml` or
-   `meta/runtime.yml` dependency declaration on `nvidia.nvue`, and a
-   version bump to 0.5.0.
-2. **OSAC mono-repo PR** (this branch's scope once upstream releases):
-   - bump `ansible_network.network_runner` to `0.5.0` in
+1. **Upstream PRs to `ybettan/network-runner`**: the provider task
+   changes, their molecule/unit tests, a dependency declaration on
+   `nvidia.nvue` (and `ansible.netcommon` for phase 2), and version
+   bumps (0.5.0 for phase 1, 0.6.0 for phase 2).
+2. **OSAC mono-repo PRs** (this branch's scope once upstream
+   releases):
+   - bump `ansible_network.network_runner` in
      `collections/requirements.yml`;
    - add `nvidia.nvue` (Galaxy-published, GPL-2.0-or-later, requires
      ansible-core >= 2.15, which the EE already satisfies) to
-     `collections/requirements.yml`;
+     `collections/requirements.yml` — `ansible.netcommon` is already
+     vendored;
    - run `make vendor-collections` (needs Automation Hub credentials)
      and review the complete `vendor/` diff, per the component rules;
    - rebuild the execution environment
      (`make execution-environment-build`) since the EE image must
      carry `nvidia.nvue` for AAP job runs;
    - update the fixtures and tests below;
-   - update `docs/INTEGRATION-TESTING.md` and the touched-area map only
-     if commands or coverage boundaries change.
+   - update the AgentlessNet VN inventory documentation for the REST
+     endpoint and TLS requirements;
+   - update `docs/INTEGRATION-TESTING.md` and the touched-area map
+     only if commands or coverage boundaries change.
 
 ## Test impact
 
 | Area | Change |
 |---|---|
-| `tests/integration/fixtures/agentless_switch/ssh` | The fake endpoint currently parses the exact `nv set`/`nv unset`/`nv config apply` shell lines. With `nvidia.nvue.command`, Ansible ships a Python module to the switch over SSH instead of a shell snippet; the fixture must either emulate the module protocol or expose a minimal `nv`/`python3` surface. Prototype during the upstream PR, not before. |
-| `tests/integration/targets/agentless_net_contract` | Partial switch-apply retry, delete-wins guard refusal (exit 73), port restoration: keep asserting, adjust to the new failure surfaces. |
-| `tests/integration/targets/agentless_net_switch` | VLAN discovery and trunk reconciliation: unchanged (read tasks not migrated). |
-| `tests/unit` (AgentlessNet switch-output mocks) | Update mocked command output where provider task names or command shapes change. |
+| `tests/integration/fixtures/agentless_switch/ssh` | Phase 1: must emulate the shipped-module protocol or expose a minimal `nv`/`python3` surface. Phase 2: replaced by an HTTP fake of `nvued` modeled on `tests/integration/fixtures/netris/fake_netris.py` (stateful, per-revision config, apply/rollback semantics); the SSH fake is retired with the SSH transport. |
+| `tests/integration/targets/agentless_net_contract` | Partial switch-apply retry, delete-wins guard refusal, port restoration: keep asserting the observable semantics; adjust to REST error surfaces (HTTP status classes replacing exit codes, e.g. 73). |
+| `tests/integration/targets/agentless_net_switch` | Phase 1: unchanged (read tasks not migrated). Phase 2: VLAN discovery and trunk reconciliation move onto the HTTP fake; normalized discovery and reserved ranges keep being asserted. |
+| `tests/unit` (AgentlessNet switch-output mocks) | Update mocked transport output where provider task names or shapes change. |
+| TLS/session handling | Follow the Netris precedent: unit tests proving the REST transport cannot silently skip certificate validation and that credentials stay redacted, mirroring `test_netris_tls.py`. |
 | Wire goldens (`tests/contract/network-task`) | No change: the manager task contract, inputs, and results are untouched. |
 | Coverage gate | Any new `when`/`rescue`/fail path in the provider needs a test or an entry in `tests/coverage/exclusions.yaml` — note the coverage gate measures `roles/netris`, `roles/cudn_evpn` only; provider files under `vendor/` are reported, not gated. |
 
 ## Behavioral deltas and risks
 
-- **Diff validation removed** (see above): a pending unrelated NVUE
+- **Diff validation removed** (both phases): a pending unrelated NVUE
   change could be applied together with the provider's change. NVUE
   apply is atomic per revision, so the blast radius is one apply
   carrying both changes. Flag to reviewers; keep if unacceptable.
-- **Guard/apply no longer atomic under one lock**: the guard check and
-  the module's apply are separate steps. The window between them is the
-  same one the current `flock` design closes; mitigation is that
-  `nvidia.nvue.command`'s apply still takes the NVUE config lock
-  internally. If the delete-wins race reappears in contract tests, wrap
-  the module call in a `flock`-guarded `ansible.builtin.script`
-  fallback instead.
+- **Guard/apply no longer atomic under one lock**: in phase 1 the
+  guard check and the module's apply are separate steps; in phase 2
+  the guard moves into caller-owned state. Either way the delete-wins
+  race is closed at a different layer than today's single `flock`
+  region; the contract targets are the proof and must keep passing.
+- **Switch floor raises to Cumulus 5.6+** for the REST path (NVUE
+  REST default-enabled; 5.4/5.5 stay on phase 1 if needed). State the
+  floor in the network-runner README.
+- **Credential and exposure policy**: REST moves switch management
+  onto the management network as an HTTPS service with basic-auth
+  credentials. Deployment documentation must cover the
+  `cumulus`-user password-change requirement (403 until changed) and
+  certificate handling.
 - **Collection support level**: `nvidia.nvue` is community-supported
-  ("best effort", validated on Cumulus Linux 5.4+). The provider's
-  supported Cumulus floor should be stated as 5.4+ in the network-runner
-  README.
+  ("best effort"). The httpapi plugin surface we depend on is small;
+  pin the version in `collections/requirements.yml`.
 - **Live-switch equivalence**: acceptance requires lab validation on a
   real Cumulus switch comparing `nv config show` before/after for the
   same task sequence. That is QE work under the
@@ -153,11 +214,13 @@ lands in two places, in order:
 
 ## Acceptance criteria mapping
 
-- Cumulus provider uses `nvidia.nvue` for the migrated operations:
-  mutating tasks migrate; read tasks and guard plumbing are documented
-  gaps with rationale.
-- Collection dependencies declared: upstream `nvidia.nvue` requirement
-  in network-runner plus `collections/requirements.yml` in OSAC.
-- Equivalent behavior: contract targets assert guard refusal, retry and
-  restoration semantics; live-switch equivalence is QE-run under
-  OSAC-4843; remaining gaps documented above.
+- Cumulus provider uses `nvidia.nvue` instead of direct `nv` commands
+  for the migrated operations: phase 1 covers mutating tasks; phase 2
+  covers mutating and read tasks over REST.
+- Collection dependencies declared: upstream `nvidia.nvue`
+  requirement in network-runner plus `collections/requirements.yml`
+  in OSAC (with `ansible.netcommon` for phase 2).
+- Equivalent behavior: contract targets assert guard refusal, retry
+  and restoration semantics against the new transport; live-switch
+  equivalence is QE-run under OSAC-4843; remaining gaps documented
+  above.
