@@ -80,12 +80,14 @@ of which are API-connected.
 ### Switch prerequisites are smaller than first assessed
 
 Since Cumulus Linux 5.6, the NVUE REST API is **enabled by default**
-on port 8765 (HTTPS, basic auth). The real caveats: on 5.4/5.5 it
-requires manual nginx enablement; the API returns 403 until the
-`cumulus` user's default password is changed; and the default
-certificate is self-signed, so a TLS-verification policy decision is
-required. The provider's supported floor should therefore be stated
-as Cumulus 5.6+ for the REST path.
+on port 8765 (HTTPS, basic auth). The remaining caveats are the
+pre-5.6 brownfield (manual nginx enablement on 5.4/5.5) and day-0
+state: the API returns 403 until the `cumulus` user's default
+password is changed, and the default certificate is self-signed.
+Both are standard customer hardening the REST path makes mandatory
+and verifiable (see the risks section) rather than extra burdens.
+The provider's supported floor should therefore be stated as
+Cumulus 5.6+ for the REST path.
 
 ## Target design
 
@@ -120,9 +122,11 @@ for uncovered paths) with `ansible.netcommon.httpapi` and
   the `agentless_net_stub` target) is extended to validate the REST
   endpoint shape and to keep rejecting password-based SSH access.
 - **TLS policy**: `ansible_httpapi_validate_certs` defaults to true
-  with a documented CA-injection path for the self-signed default
-  certificate, following the Netris precedent where certificate
-  validation cannot be bypassed silently.
+  with a documented CA-injection path, following the Netris precedent
+  where certificate validation cannot be bypassed silently. Customers
+  install a proper internal-CA certificate via
+  `nv set system api certificate`; the self-signed default is treated
+  as day-0 convenience, not an operating state.
 - **Deletion guards**: the exit-73 delete-wins protocol is
   reimplemented as an API-equivalent check — the guard directory
   moves to a provider-visible location read over the same transport,
@@ -198,11 +202,21 @@ lands in two places, in order, per phase:
 - **Switch floor raises to Cumulus 5.6+** for the REST path (NVUE
   REST default-enabled; 5.4/5.5 stay on phase 1 if needed). State the
   floor in the network-runner README.
-- **Credential and exposure policy**: REST moves switch management
-  onto the management network as an HTTPS service with basic-auth
-  credentials. Deployment documentation must cover the
-  `cumulus`-user password-change requirement (403 until changed) and
-  certificate handling.
+- **Credential and certificate prerequisites are standard hardening
+  the REST path enforces rather than imposes**: Cumulus 5.6+ refuses
+  API requests (403) until the `cumulus` user's default password is
+  changed, so any fleet actually using REST has already done it; the
+  SSH path trusts the same change invisibly. The design requires
+  proper certificates too — `ansible_httpapi_validate_certs: true`
+  with a documented CA-injection path, as customers already run an
+  internal CA for the Netris controller, Keycloak, AAP and the
+  Kubernetes API in an OSAC deployment; the self-signed default is
+  day-0 convenience only. Exposure is not widened: port 8765 needs
+  the same management-network reachability SSH already requires, over
+  a narrower surface (HTTPS with authentication and request
+  auditability instead of an interactive shell), and can be scoped
+  with `nv set system api listening-address`. Deployment
+  documentation covers these as prerequisites, not risks.
 - **Collection support level**: `nvidia.nvue` is community-supported
   ("best effort"). The httpapi plugin surface we depend on is small;
   pin the version in `collections/requirements.yml`.
